@@ -57,13 +57,16 @@ class Gomoku:
     # ----------------------
     # jogadas / undo
     # ----------------------
-    def do_move(self, move: Tuple[int, int]) -> bool:
+    def do_move(self, move) -> bool:
         """
         Executa uma jogada.
-        - move: (r,c)
+        - move: (r,c) 元组或扁平动作索引 0..size*size-1
         - retorna True se jogada for válida e aplicada, False caso contrário.
         """
-        r, c = move
+        if isinstance(move, (tuple, list)):
+            r, c = int(move[0]), int(move[1])
+        else:
+            r, c = divmod(int(move), self.size)
         if not (0 <= r < self.size and 0 <= c < self.size):
             return False
         if self.board[r, c] != 0:

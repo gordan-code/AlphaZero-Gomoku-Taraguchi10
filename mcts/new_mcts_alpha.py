@@ -26,7 +26,7 @@ class MCTS:
         self.N = {}
         self.W = {}
         self.children = {}
-        self.action_size = game_class().size ** 2
+        self.action_size = game_class().action_size
 
         # Batch prediction queue
         self.pending_states = []
@@ -41,17 +41,19 @@ class MCTS:
     # -------------------------
     def symmetries(self, state, pi):
         size = state.shape[1]
-        pi = pi.reshape(size, size)
+        n_pos = size * size
+        pos_pi = pi[:n_pos].reshape(size, size)
+        dec_pi = pi[n_pos:]  # 决策动作 logits（swap/variant），与对称无关
 
         out = []
         for k in range(4):
             rotated_s = np.rot90(state, k, axes=(1, 2))
-            rotated_pi = np.rot90(pi, k)
-            out.append((rotated_s, rotated_pi.flatten()))
+            rotated_pos = np.rot90(pos_pi, k)
+            out.append((rotated_s, np.concatenate([rotated_pos.flatten(), dec_pi])))
 
             flipped_s = np.flip(rotated_s, axis=2)
-            flipped_pi = np.flip(rotated_pi, axis=1)
-            out.append((flipped_s, flipped_pi.flatten()))
+            flipped_pos = np.flip(rotated_pos, axis=1)
+            out.append((flipped_s, np.concatenate([flipped_pos.flatten(), dec_pi])))
 
         return out
 
@@ -100,9 +102,7 @@ class MCTS:
     #  SEARCH
     # -------------------------
     def search(self, game_state, move_number):
-        s_key = self._state_key(game_state) # 获取当前状态的键，是bytes类型 ，是唯一标识当前状态的键，里面有棋盘数据和当前玩家
-
-        # Verificar se o jogo terminou (ganhador ou sem movimentos válidos)
+        # 终局判断
         if game_state.is_game_over():
             winner = game_state.get_winner()
             if winner == 0:
@@ -110,6 +110,13 @@ class MCTS:
             # 当前玩家还没有下棋，既然分出胜负，说明上一步的对手赢了。
             # 对于当前轮到的玩家来说，这是必输的局面，直接返回 -1。
             return -1
+
+        # 走法二的十打点/选点：策略贪心（不进树搜索），原地推进到 S6_MOVE
+        if hasattr(game_state, 'phase') and game_state.phase in ('V2_TEN_OFFER', 'V2_TEN_PICK'):
+            from games.renju.opening_greedy import resolve_greedy_opening_steps
+            resolve_greedy_opening_steps(game_state, self.nn_model)
+
+        s_key = self._state_key(game_state)
 
         if s_key not in self.P: # 如果当前状态的键不在P中，表示当前状态没有被访问过
             # adiciona à fila de batch
@@ -138,10 +145,8 @@ class MCTS:
         ucb = np.where(valid == 1, ucb, -1e9) # 将当前状态的合法动作设置为UCB值，否则设置为-1e9
 
         action = np.argmax(ucb) # 选择UCB值最大的动作
-        r, c = divmod(action, game_state.size) # 将动作转换为(r,c)坐标
-        
-        # 执行落子操作
-        game_state.do_move((r, c))   
+        # 执行动作（含交换/走法决策动作）
+        game_state.do_move(action)
 
         v = -self.search(game_state, move_number) # 递归搜索下一个状态，返回下一个状态的评估值
 
@@ -188,10 +193,7 @@ class MCTS:
     #  STATE KEY
     # -------------------------
     def _state_key(self, game_state):
-        board = game_state.board # 获取棋盘数据 (NumPy 数组)
-        player = game_state.current_player # 获取当前执棋玩家 (整数)
-        # 1. board.tobytes(): 将 NumPy 数组转换为不可变的字节串。
-        #    NumPy 数组是可变的(mutable)，不能直接作为字典的键，必须转为 bytes。
-        # 2. bytes([player]): 将玩家 ID 转换为字节。
-        # 3. + : 将两者拼接。
-        return board.tobytes() + bytes([player]) 
+        board = game_state.board
+        player = game_state.current_player
+        phase = getattr(game_state, 'phase_key', lambda: '')()
+        return board.tobytes() + bytes([player]) + phase.encode('utf-8')

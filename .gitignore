@@ -40,10 +40,16 @@ models/*.pt
 models/*.pth
 models/*.ckpt
 
-# Training data and logs
-data/
+# ONNX export artifacts (regenerate via export_onnx.py)
+*.onnx
+
+# Training data and logs (keep data/*.py source, ignore datasets)
+data/*.npz
 logs/
 *.log
+metrics/
+mirror_log.txt
+input_log.txt
 wandb/
 tensorboard/
 runs/
@@ -100,4 +106,4 @@ coverage.xml
 .dmypy.json
 dmypy.json
 
-models/replay_buffer_latest.pkl
+replay_buffer_latest.pkl

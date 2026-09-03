@@ -6,6 +6,36 @@ import torch.nn.functional as F
 import os
 
 
+def infer_in_channels(action_size: int, board_size: int) -> int:
+    """根据动作空间推断输入通道数：含决策动作（renju，action_size > size²）→ 4，否则 3。"""
+    return 4 if action_size > board_size * board_size else 3
+
+
+def _migrate_in_channels(net_state: dict, target_in_channels: int):
+    """把旧 3 通道 checkpoint 的 conv 权重迁移到新的 4 通道网络。
+
+    旧编码 [my, opp, phase] → 新编码 [my, opp, forbidden, phase]：
+    通道 0/1 不变，旧通道 2（phase）移到新通道 3，新通道 2（forbidden）补零。
+    返回 (net_state, migrated)：migrated=True 表示发生了通道迁移（此时应丢弃优化器状态）。
+    """
+    key = "conv.weight"
+    if key not in net_state:
+        return net_state, False
+    w = net_state[key]
+    actual = int(w.shape[1])
+    if actual == target_in_channels:
+        return net_state, False
+    if actual == 3 and target_in_channels == 4:
+        out = w.new_zeros(w.shape[0], 4, w.shape[2], w.shape[3])
+        out[:, 0] = w[:, 0]
+        out[:, 1] = w[:, 1]
+        out[:, 3] = w[:, 2]
+        migrated = dict(net_state)
+        migrated[key] = out
+        return migrated, True
+    raise ValueError(f"无法迁移输入通道数 {actual} -> {target_in_channels}（仅支持 3 -> 4）")
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
@@ -145,13 +175,16 @@ class PyTorchModel:
                  n_res_blocks: int = 3,
                  channels: int = 64,
                  lr: float = 1e-3,
-                 weight_decay: float = 1e-4):
+                 weight_decay: float = 1e-4,
+                 in_channels: Optional[int] = None):
         self.board_size = board_size
         self.action_size = action_size if action_size is not None else board_size * board_size
+        # 未显式指定时按动作空间推断：renju（action_size=size²+4）→ 4 通道，否则 3 通道
+        self.in_channels = in_channels if in_channels is not None else infer_in_channels(self.action_size, self.board_size)
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.net = AlphaZeroNet(
-            in_channels=3,
+            in_channels=self.in_channels,
             board_size=board_size,
             action_size=self.action_size,
             n_res_blocks=n_res_blocks,
@@ -243,15 +276,18 @@ class PyTorchModel:
             "net": self.net.state_dict(),
             "opt": self.optimizer.state_dict(),
             "board_size": self.board_size,
-            "action_size": self.action_size
+            "action_size": self.action_size,
+            "in_channels": self.in_channels,
         }
         torch.save(state, path)
 
     def load(self, path: str, map_location: Optional[str] = None) -> None:
         map_location = map_location or self.device
         state = torch.load(path, map_location=map_location)
-        self.net.load_state_dict(state["net"])
-        if "opt" in state and state["opt"] is not None:
+        net_state, migrated = _migrate_in_channels(state["net"], self.in_channels)
+        self.net.load_state_dict(net_state)
+        # 发生通道迁移时丢弃优化器状态（动量张量形状与参数不匹配），仅保留权重。
+        if not migrated and "opt" in state and state["opt"] is not None:
             try:
                 self.optimizer.load_state_dict(state["opt"])
             except Exception:

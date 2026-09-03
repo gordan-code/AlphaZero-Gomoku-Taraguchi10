@@ -7,7 +7,7 @@ import numpy as np
 import os
 from pathlib import Path
 
-from games.gomoku import Gomoku
+from games import get_game_class
 
 METRICS = Path("metrics")
 RED = "\033[31m"
@@ -29,8 +29,10 @@ def load_player(module_name, rules, size):
     raise ValueError(f"Nenhuma classe Player encontrada em {module_name}")
 
 # ====== GAME MENU ======
-def choose_game():
-    # Projeto agora suporta apenas Gomoku
+def choose_game(argv=None):
+    # 支持命令行指定规则：python play_loop.py p1 p2 n [gomoku|renju|pente]
+    if argv and len(argv) >= 5 and argv[4].lower() in ("gomoku", "renju", "pente"):
+        return argv[4].lower()
     return "gomoku"
 
 def change_starting_player(player1_name, player2_name, game, game_name, size, metrics, game_iter):
@@ -46,16 +48,25 @@ def change_starting_player(player1_name, player2_name, game, game_name, size, me
 
     turn_number = 0
 
-    r = random.randint(0, 14)
-    c = random.randint(0, 14)
-    game.do_move((r, c))
-    metrics["move_made"][player1_name][f"game_{game_iter}"].append((r,c))
-    metrics["time_for_each_move"][player1_name][f"game_{game_iter}"].append(0)
+    if hasattr(game, "resolve_opening_to_play"):
+        # 连珠：用确定性策略走完塔拉山口-10 开局
+        game.resolve_opening_to_play()
+    else:
+        r = random.randint(0, 14)
+        c = random.randint(0, 14)
+        game.do_move((r, c))
+        metrics["move_made"][player1_name][f"game_{game_iter}"].append((r,c))
+        metrics["time_for_each_move"][player1_name][f"game_{game_iter}"].append(0)
     game.display()
 
     # Loop principal
     while not game.is_game_over():
         player = players[game.current_player]
+        # 连珠走法二的十打点/选点：由当前玩家模型贪心解析（原地推进）
+        if hasattr(player, 'resolve_opening'):
+            player.resolve_opening(game)
+            if game.is_game_over():
+                break
 
         valid_move = False
         while not valid_move:
@@ -183,16 +194,17 @@ def to_json_safe(obj):
     return obj
 
 def loop_for_n_games():
-    if len(sys.argv) != 4:
-        print("Uso: python play_loop.py <player1> <player2> <n_games>")
-        print("Exemplo: python play_loop.py player_human player_mcts 50")
+    # 第 4 个参数可选：规则名（gomoku/renju/pente），与 play.py 保持一致
+    if len(sys.argv) < 4:
+        print("Uso: python play_loop.py <player1> <player2> <n_games> [gomoku|renju|pente]")
+        print("Exemplo: python play_loop.py player_human player_mcts 50 renju")
         sys.exit(1)
 
     player1_name, player2_name, n_games = sys.argv[1:4]
     n_games = int(n_games)
 
     # Menu interativo
-    game_name = choose_game()
+    game_name = choose_game(sys.argv)
     size = 15
 
     player1 = load_player(player1_name,game_name,size)
@@ -205,7 +217,7 @@ def loop_for_n_games():
 
     # Inicializa o jogo
     for i in range(n_games):
-        game = Gomoku(size)
+        game = get_game_class(game_name)(size)
         
         if i % 2 == 0:
             game_start_time = time.time()

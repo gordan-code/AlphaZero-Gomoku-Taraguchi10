@@ -1,3 +1,4 @@
+import argparse
 import os
 import time
 import random
@@ -6,7 +7,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 from network import PyTorchModel
 from mcts.new_mcts_alpha import MCTS
-from games.gomoku import Gomoku as GameClass
+from games import get_game_class
 from datetime import datetime
 from copy import deepcopy
 import gc
@@ -25,6 +26,13 @@ _SELFPLAY_MODEL_META = None  # (model_path, board_size, action_size, device)
 _EVAL_MODEL_NEW = None
 _EVAL_MODEL_BEST = None
 _EVAL_MODEL_META = None  # (new_path, best_path, board_size, action_size, device)
+
+
+def _resolve_greedy_opening(game, model):
+    """连珠走法二的十打点/选点用策略贪心；五子棋无此阶段，直接跳过。"""
+    if hasattr(game, 'phase'):
+        from games.renju.opening_greedy import resolve_greedy_opening_steps
+        resolve_greedy_opening_steps(game, model)
 
 
 def _selfplay_worker_init(
@@ -61,6 +69,7 @@ def _selfplay_worker_init(
 
 def _selfplay_generate_games(
     *,
+    game_name: str = "gomoku",
     board_size: int,
     n_simulations: int,
     cpuct: float,
@@ -79,7 +88,8 @@ def _selfplay_generate_games(
     注意：为了避免 GPU 多进程争用，默认 device=cpu。
     """
     from mcts.new_mcts_alpha import MCTS
-    from games.gomoku import Gomoku as GameClass
+    from games import get_game_class
+    GameClass = get_game_class(game_name)
 
     # 多进程路径：优先复用 initializer 加载的全局模型
     global _SELFPLAY_MODEL, _SELFPLAY_MODEL_META
@@ -108,6 +118,7 @@ def _selfplay_generate_games(
         )
         game = GameClass(size=board_size)
         game.current_player = 1
+        # 连珠：开局（含交换/走法/十打点）由 MCTS + 策略贪心从初始状态直接搜索
 
         examples, winner = play_game_and_collect(
             mcts_play,
@@ -164,18 +175,21 @@ def _eval_worker_init(
 
 def _eval_play_games(
     *,
+    game_name: str = "gomoku",
     board_size: int,
     n_games: int,
     start_index: int,
     n_simulations: int,
     cpuct: float,
+    max_moves: int,
 ) -> Tuple[int, int, int]:
     """
     子进程评估：跑 n_games 局，使用 start_index 来决定交替先手。
     返回 (new_wins, draws, total_games)
     """
     from mcts.new_mcts_alpha import MCTS
-    from games.gomoku import Gomoku as GameClass
+    from games import get_game_class
+    GameClass = get_game_class(game_name)
 
     global _EVAL_MODEL_NEW, _EVAL_MODEL_BEST
     model_new = _EVAL_MODEL_NEW
@@ -188,15 +202,15 @@ def _eval_play_games(
         global_i = int(start_index) + gi
 
         game = GameClass(size=int(board_size))
-        # 随机第一手，增加开局多样性（评估时使用确定性选择，不随机会导致所有对局相同）
-        # 限制在中心9×9区域，避免边角的不合理开局
-        # 第一手（玩家1）
-        center = int(board_size) // 2
-        radius = 4  # 9×9区域 (81种可能 × 2先后手 = 162种组合)
-        r1 = random.randint(center - radius, center + radius)
-        c1 = random.randint(center - radius, center + radius)
-        game.do_move((r1, c1))
-        # 现在 current_player = 2，从第二手开始真正评估
+        if not hasattr(game, "phase"):
+            # 五子棋/连珠以外：随机第一手增加开局多样性
+            center = int(board_size) // 2
+            radius = 4  # 9×9区域 (81种可能 × 2先后手 = 162种组合)
+            r1 = random.randint(center - radius, center + radius)
+            c1 = random.randint(center - radius, center + radius)
+            game.do_move((r1, c1))
+            # 现在 current_player = 2，从第二手开始真正评估
+        # 连珠（renju）：从 S1_MOVE 直接开始，开局由 MCTS 搜索
 
         new_starts = (global_i % 2 == 0)
         move_number = 1
@@ -217,16 +231,18 @@ def _eval_play_games(
         )
 
         while not game.is_game_over():
+            _resolve_greedy_opening(game, mcts_new.nn_model)
+            if game.is_game_over():
+                break
             if (game.current_player == 1 and new_starts) or (game.current_player == 2 and not new_starts):
                 pi = mcts_new.run(game, len(game.move_history))
             else:
                 pi = mcts_best.run(game, len(game.move_history))
 
             action = int(np.argmax(pi))
-            rr, cc = divmod(action, game.size)
-            game.do_move((rr, cc))
+            game.do_move(action)
             move_number += 1
-            if move_number > game.size * game.size:
+            if move_number > max_moves:
                 break
 
         winner = game.get_winner()
@@ -367,6 +383,11 @@ def play_game_and_collect(mcts: MCTS, game, temp_fn, max_moves=225, use_symmetri
     move_number = 0
 
     while True:
+        # 走法二的十打点/选点用策略贪心（不进 MCTS，不存样本）
+        _resolve_greedy_opening(game, mcts.nn_model)
+        if game.is_game_over():
+            break
+
         state_enc = game.get_encoded_state()  # 期望是视角不变的
         pi = mcts.run(game, len(game.move_history))  # 向量 (action_size,) 第二个参数是当前是第几步
         # 这个参数是让MCtS 知道当前是第几步,是不是要加入dirichlet noise，用来增强MCTS的探索能力
@@ -383,9 +404,8 @@ def play_game_and_collect(mcts: MCTS, game, temp_fn, max_moves=225, use_symmetri
         # 存储 (state, pi, player)
         examples.append((state_enc, pi_for_store, int(game.current_player)))
 
-        # 执行移动
-        r, c = divmod(action, game.size)
-        game.do_move((r, c))
+        # 执行动作（含交换/走法决策动作）
+        game.do_move(action)
 
         move_number += 1
 
@@ -420,13 +440,14 @@ def evaluate_models(model_new: PyTorchModel,
                 game_name: str,
                 n_games: int = 20,
                 n_simulations: int = 100,
-                cpuct: float = 1.0) -> Tuple[int, float, int]:
+                cpuct: float = 1.0,
+                max_moves: int = 160) -> Tuple[int, float, int]:
     """
     在 model_new 和 model_best 之间进行 n_games 局游戏（轮流先手）。
     返回 (win_rate_of_new, draws)
     """
-    # 仅支持 Gomoku（保留 game_name 参数用于向后兼容）
-    rules_name = "gomoku"
+    # 根据 rules 选择游戏类（gomoku / renju / pente）
+    GameClass = get_game_class(game_name)
 
     new_wins = 0
     draws = 0
@@ -435,15 +456,15 @@ def evaluate_models(model_new: PyTorchModel,
     for i in range(n_games):
         game = GameClass(size=model_new.board_size)
 
-        # 随机第一手，增加开局多样性（评估时使用确定性选择，不随机会导致所有对局相同）
-        # 限制在中心9×9区域，避免边角的不合理开局
-        # 第一手（玩家1）
-        center = model_new.board_size // 2
-        radius = 4  # 9×9区域 (81种可能 × 2先后手 = 162种组合)
-        r1 = random.randint(center - radius, center + radius)
-        c1 = random.randint(center - radius, center + radius)
-        game.do_move((r1, c1))
-        # 现在 current_player = 2，从第二手开始真正评估
+        if not hasattr(game, "phase"):
+            # 五子棋/连珠以外：随机第一手增加开局多样性
+            center = model_new.board_size // 2
+            radius = 4  # 9×9区域 (81种可能 × 2先后手 = 162种组合)
+            r1 = random.randint(center - radius, center + radius)
+            c1 = random.randint(center - radius, center + radius)
+            game.do_move((r1, c1))
+            # 现在 current_player = 2，从第二手开始真正评估
+        # 连珠（renju）：从 S1_MOVE 直接开始，开局由 MCTS 搜索
 
         # 确定谁先手：新模型在偶数局先手
         new_starts = (i % 2 == 0)
@@ -454,6 +475,9 @@ def evaluate_models(model_new: PyTorchModel,
         mcts_best = MCTS(game_class=GameClass, n_simulations=n_simulations, nn_model=model_best, cpuct=cpuct, add_dirichlet_noise=False)
 
         while not game.is_game_over():
+            _resolve_greedy_opening(game, mcts_new.nn_model)
+            if game.is_game_over():
+                break
             # 根据当前玩家和谁先手决定谁下棋
             if (game.current_player == 1 and new_starts) or (game.current_player == 2 and not new_starts):
                 pi = mcts_new.run(game, len(game.move_history))
@@ -462,10 +486,9 @@ def evaluate_models(model_new: PyTorchModel,
 
             # 确定性选择 (argmax)
             action = int(np.argmax(pi))
-            r, c = divmod(action, game.size)
-            game.do_move((r, c))
+            game.do_move(action)
             move_number += 1
-            if move_number > game.size * game.size:
+            if move_number > max_moves:
                 break
 
         winner = game.get_winner()
@@ -497,7 +520,9 @@ def evaluate_models_mp(
     n_games: int,
     n_simulations: int,
     cpuct: float,
+    max_moves: int = 160,
     *,
+    game_name: str = "gomoku",
     model_dir: str,
     num_workers: int,
     games_per_task: int = 1,
@@ -544,11 +569,13 @@ def evaluate_models_mp(
             futures.append(
                 ex.submit(
                     _eval_play_games,
+                    game_name=game_name,
                     board_size=board_size,
                     n_games=int(gcount),
                     start_index=int(sidx),
                     n_simulations=n_simulations,
                     cpuct=cpuct,
+                    max_moves=max_moves,
                 )
             )
 
@@ -584,7 +611,11 @@ def train_alphazero(
     temp_threshold: int = 8,
     eval_games: int = 12,
     eval_mcts_simulations: int = 200,
+    eval_max_moves: int = 160,
     win_rate_threshold: float = 0.55,
+    always_accept: bool = False,
+    log_eval_games: int = 0,
+    log_eval_sims: int = 60,
     cpuct: float = 1.2,
     model_dir: str = "models",
     save_every: int = 1,
@@ -612,8 +643,9 @@ def train_alphazero(
     """
     os.makedirs(model_dir, exist_ok=True)
 
-    # 根据 board_size 计算动作空间大小
-    action_size = board_size * board_size  # 对于 Gomoku，动作是棋盘上的位置
+    # 根据规则计算动作空间大小（gomoku/pente=225，renju=225+4=229）
+    GameClass = get_game_class(game_name)
+    action_size = GameClass(size=board_size).action_size
 
     # 检查是否存在预训练模型
     if pretrained_model_path and os.path.exists(pretrained_model_path):
@@ -683,6 +715,7 @@ def train_alphazero(
                 )
                 game = GameClass(size=board_size)
                 game.current_player = 1
+                # 连珠：开局由 MCTS + 策略贪心从初始状态直接搜索
                 examples, winner = play_game_and_collect(
                     mcts_play, game, temp_fn, max_moves=max_moves, use_symmetries=use_symmetries
                 )
@@ -719,6 +752,7 @@ def train_alphazero(
                     futures.append(
                         ex.submit(
                             _selfplay_generate_games,
+                            game_name=game_name,
                             board_size=board_size,
                             n_simulations=n_simulations,
                             cpuct=cpuct,
@@ -764,50 +798,76 @@ def train_alphazero(
         else:
             print(f"训练样本不足 (buffer={len(buffer)}, 需要 {batch_size})。跳过本次迭代的训练。")
 
-        # 评估（精简输出：只在结束后汇总一次）
-        eval_t0 = time.time()
-        try:
-            # 自动评估进程数（与自对弈同策略）
-            if eval_num_workers and eval_num_workers > 0:
-                eval_workers = int(eval_num_workers)
+        if always_accept:
+            # --always-accept：跳过正式评估，直接接受候选（greedy 更新）
+            win_rate = 1.0
+            new_wins = eval_games
+            draws = 0
+            if log_eval_games > 0:
+                # 廉价评估（仅日志，不参与接受决策）
+                try:
+                    q_wins, q_rate, q_draws = evaluate_models(
+                        model_candidate,
+                        model_best,
+                        game_name,
+                        n_games=log_eval_games,
+                        n_simulations=log_eval_sims,
+                        cpuct=cpuct,
+                        max_moves=eval_max_moves,
+                    )
+                    print(f"廉价评估（仅日志）：胜率={q_rate:.3f}（{q_wins}/{log_eval_games}），平局={q_draws}")
+                except Exception as e:
+                    print(f"廉价评估失败：{e}")
             else:
-                cpu_cnt = os.cpu_count() or 2
-                eval_workers = max(1, min(8, cpu_cnt - 1))
+                print("评估已跳过（--always-accept），直接接受候选模型。")
+        else:
+            # 评估（精简输出：只在结束后汇总一次）
+            eval_t0 = time.time()
+            try:
+                # 自动评估进程数（与自对弈同策略）
+                if eval_num_workers and eval_num_workers > 0:
+                    eval_workers = int(eval_num_workers)
+                else:
+                    cpu_cnt = os.cpu_count() or 2
+                    eval_workers = max(1, min(8, cpu_cnt - 1))
 
-            if eval_workers == 1:
-                new_wins, win_rate, draws = evaluate_models(
-                    model_candidate,
-                    model_best,
-                    game_name,
-                    n_games=eval_games,
-                    n_simulations=eval_mcts_simulations,
-                    cpuct=cpuct,
-                )
-            else:
-                new_wins, win_rate, draws = evaluate_models_mp(
-                    model_candidate,
-                    model_best,
-                    board_size=board_size,
-                    action_size=action_size,
-                    n_games=eval_games,
-                    n_simulations=eval_mcts_simulations,
-                    cpuct=cpuct,
-                    model_dir=model_dir,
-                    num_workers=eval_workers,
-                    games_per_task=eval_games_per_task,
-                    device=eval_device,
-                    base_seed=eval_base_seed,
-                    torch_threads=eval_torch_threads,
-                )
-        except Exception as e:
-            # 保持可见性，但不刷屏
-            print(f"评估失败：{e}")
-            new_wins, win_rate, draws = 0, 0.0, 0
+                if eval_workers == 1:
+                    new_wins, win_rate, draws = evaluate_models(
+                        model_candidate,
+                        model_best,
+                        game_name,
+                        n_games=eval_games,
+                        n_simulations=eval_mcts_simulations,
+                        cpuct=cpuct,
+                        max_moves=eval_max_moves,
+                    )
+                else:
+                    new_wins, win_rate, draws = evaluate_models_mp(
+                        model_candidate,
+                        model_best,
+                        game_name=game_name,
+                        board_size=board_size,
+                        action_size=action_size,
+                        n_games=eval_games,
+                        n_simulations=eval_mcts_simulations,
+                        cpuct=cpuct,
+                        max_moves=eval_max_moves,
+                        model_dir=model_dir,
+                        num_workers=eval_workers,
+                        games_per_task=eval_games_per_task,
+                        device=eval_device,
+                        base_seed=eval_base_seed,
+                        torch_threads=eval_torch_threads,
+                    )
+            except Exception as e:
+                # 保持可见性，但不刷屏
+                print(f"评估失败：{e}")
+                new_wins, win_rate, draws = 0, 0.0, 0
 
-        eval_t1 = time.time()
-        print(
-            f"评估完成：耗时 {(eval_t1 - eval_t0)/60:.2f} 分钟，胜率={win_rate:.3f}（{new_wins}/{eval_games}），平局={draws}"
-        )
+            eval_t1 = time.time()
+            print(
+                f"评估完成：耗时 {(eval_t1 - eval_t0)/60:.2f} 分钟，胜率={win_rate:.3f}（{new_wins}/{eval_games}），平局={draws}"
+            )
 
         # 接受/拒绝
         if win_rate >= win_rate_threshold:
@@ -842,49 +902,127 @@ def train_alphazero(
     print("\n=== 训练完成 ===")
 
 # -------------------------
-#  入口点
+#  命令行入口
 # -------------------------
+def build_parser() -> argparse.ArgumentParser:
+    """构造命令行解析器。所有默认值与 train_alphazero 的签名默认值保持一致。"""
+    p = argparse.ArgumentParser(
+        description="AlphaZero 五子棋训练入口（Gomoku/Pente/Renju）",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # --- 游戏与规则 ---
+    p.add_argument("--game", default="gomoku", choices=["gomoku", "pente", "renju"],
+                   help="游戏规则。renju 第 6 手起启用黑方禁手；小测试建议用 gomoku（无禁手）")
+    p.add_argument("--board-size", type=int, default=15, help="棋盘边长（N x N）")
+    p.add_argument("--n-in-row", type=int, default=5,
+                   help="连成几子获胜。当前 Gomoku 逻辑硬编码为 5，仅支持 5")
+
+    # --- 训练主循环 ---
+    p.add_argument("--num-iterations", type=int, default=5, help="训练迭代次数")
+    p.add_argument("--games-per-iteration", type=int, default=8, help="每轮自对弈局数")
+    p.add_argument("--num-simulations", type=int, default=50, help="自对弈时 MCTS 每步模拟次数")
+    p.add_argument("--cpuct", type=float, default=1.2, help="MCTS 探索/利用平衡因子")
+    p.add_argument("--buffer-size", type=int, default=10000, help="经验回放缓冲区容量")
+    p.add_argument("--batch-size", type=int, default=128, help="训练批次大小")
+    p.add_argument("--epochs", type=int, default=2, help="每次迭代的训练轮数（epochs_per_iter）")
+    p.add_argument("--temp-threshold", type=int, default=8, help="温度退火阈值（前 N 手带探索温度）")
+
+    # --- 评估 ---
+    p.add_argument("--eval-games", type=int, default=12, help="每次迭代评估的对局数")
+    p.add_argument("--eval-simulations", type=int, default=200, help="评估时 MCTS 每步模拟次数")
+    p.add_argument("--eval-max-moves", type=int, default=160, help="评估对局手数上限（超限判和，防止马拉松局）")
+    p.add_argument("--win-rate-threshold", type=float, default=0.55, help="候选模型被接受的最低胜率")
+    p.add_argument("--always-accept", action="store_true", help="跳过评估，每轮直接接受候选模型（greedy 更新，省评估耗时）")
+    p.add_argument("--log-eval-games", type=int, default=0, help="always-accept 下的廉价评估局数（0=关闭；仅日志不参与决策）")
+    p.add_argument("--log-eval-sims", type=int, default=60, help="廉价评估每步模拟次数")
+
+    # --- Dirichlet 噪声 ---
+    p.add_argument("--dirichlet-alpha", type=float, default=0.03, help="Dirichlet 噪声 alpha")
+    p.add_argument("--dirichlet-epsilon", type=float, default=0.25, help="Dirichlet 噪声混合比例")
+    p.add_argument("--dirichlet-n-moves", type=int, default=30, help="前 N 手添加 Dirichlet 噪声")
+
+    # --- 保存 / 续训 ---
+    p.add_argument("--model-dir", default="models", help="模型与 buffer 保存目录")
+    p.add_argument("--save-every", type=int, default=1, help="每隔多少次迭代保存一次快照")
+    p.add_argument("--pretrained-model", default=None,
+                   help="预训练模型路径（None/空串/none 表示从头训练）")
+    p.add_argument("--resume-iteration", type=int, default=1, help="从第几次迭代继续（续训）")
+
+    # --- 多进程自对弈 ---
+    p.add_argument("--selfplay-workers", type=int, default=0,
+                   help="自对弈进程数（0=自动，CPU 核数-1，最多 8）")
+    p.add_argument("--selfplay-device", default="cpu", help="自对弈设备（建议 cpu，多进程 cuda 有争用风险）")
+    p.add_argument("--selfplay-games-per-task", type=int, default=1, help="每个自对弈任务包含的局数")
+    p.add_argument("--selfplay-threads", type=int, default=1, help="每个自对弈子进程内 torch CPU 线程数")
+
+    # --- 多进程评估 ---
+    p.add_argument("--eval-workers", type=int, default=0,
+                   help="评估进程数（0=自动，CPU 核数-1，最多 8）")
+    p.add_argument("--eval-device", default="cpu", help="评估设备（建议 cpu）")
+    p.add_argument("--eval-games-per-task", type=int, default=1, help="每个评估任务的对局数")
+    p.add_argument("--eval-threads", type=int, default=1, help="每个评估子进程内 torch CPU 线程数")
+
+    return p
+
+
+def main(argv=None) -> None:
+    args = build_parser().parse_args(argv)
+
+    # n-in-row 目前只有 5 是有效值（Gomoku.check_winner 硬编码 count >= 5）
+    if args.n_in_row != 5:
+        raise SystemExit(
+            f"--n-in-row 目前只支持 5（游戏胜负判定硬编码为 5 连），收到 {args.n_in_row}"
+        )
+
+    # 归一化预训练模型路径：空串 / "none" 视为从头训练
+    pretrained = args.pretrained_model
+    if pretrained is None or str(pretrained).strip() == "" or str(pretrained).strip().lower() == "none":
+        pretrained = None
+
+    train_alphazero(
+        game_name=args.game,
+        board_size=args.board_size,
+
+        num_iterations=args.num_iterations,
+        games_per_iteration=args.games_per_iteration,
+        n_simulations=args.num_simulations,
+        cpuct=args.cpuct,
+
+        buffer_size=args.buffer_size,
+        batch_size=args.batch_size,
+        epochs_per_iter=args.epochs,
+        temp_threshold=args.temp_threshold,
+
+        eval_games=args.eval_games,
+        eval_mcts_simulations=args.eval_simulations,
+        eval_max_moves=args.eval_max_moves,
+        win_rate_threshold=args.win_rate_threshold,
+        always_accept=args.always_accept,
+        log_eval_games=args.log_eval_games,
+        log_eval_sims=args.log_eval_sims,
+
+        dirichlet_alpha=args.dirichlet_alpha,
+        dirichlet_epsilon=args.dirichlet_epsilon,
+        dirichlet_n_moves=args.dirichlet_n_moves,
+
+        model_dir=args.model_dir,
+        save_every=args.save_every,
+        pretrained_model_path=pretrained,
+        next_iteration_continuation=args.resume_iteration,
+
+        selfplay_num_workers=args.selfplay_workers,
+        selfplay_device=args.selfplay_device,
+        selfplay_games_per_task=args.selfplay_games_per_task,
+        selfplay_torch_threads=args.selfplay_threads,
+
+        eval_num_workers=args.eval_workers,
+        eval_device=args.eval_device,
+        eval_games_per_task=args.eval_games_per_task,
+        eval_torch_threads=args.eval_threads,
+    )
+
+
 if __name__ == "__main__":
     mp.freeze_support()
-    train_alphazero(
-        game_name="gomoku",           # 游戏 Gomoku
-        board_size=15,                # 棋盘大小 (15x15)
-
-        num_iterations=300,           # 30 次训练迭代
-        games_per_iteration=70,       # 每次迭代 70 局游戏
-
-        n_simulations=1600,          # MCTS 1600 次模拟
-        cpuct=1.0,                   # MCTS 的探索/利用平衡因子
-
-        buffer_size=60000,           # 经验回放缓冲区，最多 60,000 个样本
-        batch_size=128,               # 每个训练批次 128 个样本
-        epochs_per_iter=5,           # 每次迭代 3 个训练轮次
-
-        temp_threshold=10,           # 探索温度阈值
-        eval_games=60,               # 50 局评估游戏（提高统计稳定性）
-        eval_mcts_simulations=1600,  # 评估时 MCTS 1600 次模拟
-        win_rate_threshold=0.5,     # 如果候选模型胜率达到 52% 则接受
-
-        # Dirichlet噪声参数（AlphaZero标准配置）
-        dirichlet_alpha=0.05,        # Dirichlet噪声的alpha参数（围棋论文标准值）
-        dirichlet_epsilon=0.15,      # 噪声混合比例（根节点探索）
-        dirichlet_n_moves=10,        # 前30手添加噪声（增加开局多样性）
-
-        model_dir="models",          # 保存模型的目录
-        save_every=1,                # 每次迭代保存模型
-        pretrained_model_path="models/snapshot_iter140_20260109_190822.pt",  # 预训练模型路径（None 表示从头训练）
-
-        next_iteration_continuation=141,  # 从第 101 次迭代开始
-
-        # 多进程自对弈：28 个进程
-        selfplay_num_workers=28,
-        selfplay_device="cpu",
-        selfplay_games_per_task=1,
-        selfplay_torch_threads=1,
-
-        # 多进程评估：28 个进程
-        eval_num_workers=28,
-        eval_device="cpu",
-        eval_games_per_task=1,
-        eval_torch_threads=1,
-    )
+    main()
