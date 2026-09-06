@@ -194,6 +194,26 @@ class PyTorchModel:
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr, weight_decay=weight_decay)
         self.value_loss_fn = nn.MSELoss()
         self.policy_loss_fn = nn.KLDivLoss(reduction='batchmean')  # log_probs vs target probs
+        self._value_only = False
+
+    def set_value_only_finetune(self, enabled: bool = True) -> None:
+        """微调模式：冻结 trunk + 策略头（含 BN 统计量），只训练价值头。
+
+        用于强冠军模型的继续训练：策略分布保持不变（MCTS 选路不变），
+        仅提升价值评估精度——消除全量更新把已收敛策略训坏的问题。
+        """
+        self._value_only = enabled
+        lr = self.optimizer.defaults["lr"]
+        wd = self.optimizer.defaults.get("weight_decay", 1e-4)
+        if enabled:
+            for name, p in self.net.named_parameters():
+                p.requires_grad = name.startswith("value")
+            params = [p for p in self.net.parameters() if p.requires_grad]
+        else:
+            for p in self.net.parameters():
+                p.requires_grad = True
+            params = list(self.net.parameters())
+        self.optimizer = torch.optim.Adam(params, lr=lr, weight_decay=wd)
 
     # -------------------------
     # 预测（用于MCTS的批次）
@@ -235,6 +255,11 @@ class PyTorchModel:
                     target_vs: np.ndarray,
                     epochs: int = 1) -> dict:
         self.net.train()
+        if self._value_only:
+            # 冻结模块切回 eval：防止 BN 在训练模式下漂移运行统计量、间接改变冻结的策略
+            for name, m in self.net.named_modules():
+                if not name.startswith("value") and isinstance(m, nn.BatchNorm2d):
+                    m.eval()
         states_t = torch.from_numpy(states.astype(np.float32)).to(self.device)
         target_pis_t = torch.from_numpy(target_pis.astype(np.float32)).to(self.device)
         target_vs_t = torch.from_numpy(target_vs.astype(np.float32)).to(self.device)
@@ -251,7 +276,7 @@ class PyTorchModel:
             policy_loss = self.policy_loss_fn(log_probs, target_pis_t)
             value_loss = self.value_loss_fn(values, target_vs_t)
 
-            loss = policy_loss + value_loss
+            loss = value_loss if self._value_only else (policy_loss + value_loss)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.net.parameters(), 3.0)
             self.optimizer.step()

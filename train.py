@@ -621,6 +621,9 @@ def train_alphazero(
     save_every: int = 1,
     pretrained_model_path: Optional[str] = None,  # 新参数，用于传递预训练模型
     next_iteration_continuation: int = 1,
+    lr: float = 1e-3,                             # 学习率（微调强冠军时可调低）
+    lr_decay: float = 1.0,                        # 每迭代学习率乘子（1.0=不衰减）
+    train_value_only: bool = False,               # 只训价值头：冻结 trunk+策略（含 BN 统计量）
     # --- MCTS Dirichlet噪声参数 ---
     dirichlet_alpha: float = 0.03,             # Dirichlet噪声的alpha参数
     dirichlet_epsilon: float = 0.25,           # Dirichlet噪声的混合比例
@@ -650,17 +653,31 @@ def train_alphazero(
     # 检查是否存在预训练模型
     if pretrained_model_path and os.path.exists(pretrained_model_path):
         print(f"从以下路径加载预训练模型: {pretrained_model_path}")
-        model_best = PyTorchModel(board_size=board_size, action_size=action_size)
+        model_best = PyTorchModel(board_size=board_size, action_size=action_size, lr=lr)
         model_best.load(pretrained_model_path)  # 加载预训练模型
-        model_candidate = PyTorchModel(board_size=board_size, action_size=action_size)
+        model_candidate = PyTorchModel(board_size=board_size, action_size=action_size, lr=lr)
         model_candidate.net.load_state_dict(model_best.net.state_dict())
         print("预训练模型加载成功。")
     else:
         print("未找到预训练模型。初始化新模型。")
-        model_best = PyTorchModel(board_size=board_size, action_size=action_size)
-        model_candidate = PyTorchModel(board_size=board_size, action_size=action_size)
+        model_best = PyTorchModel(board_size=board_size, action_size=action_size, lr=lr)
+        model_candidate = PyTorchModel(board_size=board_size, action_size=action_size, lr=lr)
         # 关键：让候选模型复制最佳模型的初始权重，确保第一轮评估公平
         model_candidate.net.load_state_dict(model_best.net.state_dict())
+
+    if train_value_only:
+        model_candidate.set_value_only_finetune(True)
+        print("[fine-tune] 价值头单独微调模式：trunk+策略已冻结")
+
+    lr_state = {"cur": lr}
+
+    def make_candidate() -> PyTorchModel:
+        """从当前冠军重建候选：保留学习率与 value-only 冻结配置（接受/拒绝路径共用）。"""
+        m = PyTorchModel(board_size=board_size, action_size=action_size, lr=lr_state["cur"])
+        m.net.load_state_dict(model_best.net.state_dict())
+        if train_value_only:
+            m.set_value_only_finetune(True)
+        return m
 
     # 经验回放缓冲区
     buffer_filepath = os.path.join(model_dir, "replay_buffer_latest.pkl")
@@ -680,6 +697,10 @@ def train_alphazero(
         return max(0.0, 1.0 - move_number / temp_threshold)
 
     for it in range(next_iteration_continuation, next_iteration_continuation + num_iterations):
+        cur_lr = lr * (lr_decay ** (it - next_iteration_continuation))
+        lr_state["cur"] = cur_lr
+        for g in model_candidate.optimizer.param_groups:
+            g["lr"] = cur_lr
         t0 = time.time()
         print(f"\n=== ITER {it}/{next_iteration_continuation + num_iterations - 1}: 自对弈生成 (games={games_per_iteration}, sims={n_simulations}), 开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
         selfplay_t0 = time.time()
@@ -874,17 +895,14 @@ def train_alphazero(
             print(" 候选模型被接受 -> 提升为最佳模型。")
             # 更新 model_best（深拷贝权重和优化器状态）
             model_best.net.load_state_dict(model_candidate.net.state_dict())
-            model_best.optimizer.load_state_dict(model_candidate.optimizer.state_dict())
-            # 从最佳模型创建新的候选模型
-            model_candidate = PyTorchModel(board_size=board_size, action_size=action_size)
-            model_candidate.net.load_state_dict(model_best.net.state_dict())
-            model_candidate.optimizer.load_state_dict(model_best.optimizer.state_dict())
+            if not train_value_only:
+                model_best.optimizer.load_state_dict(model_candidate.optimizer.state_dict())
+            # 从最佳模型创建新的候选模型（保留 lr / value-only 配置）
+            model_candidate = make_candidate()
         else:
             print(" 候选模型被拒绝 -> 从最佳模型恢复候选模型。")
-            # 从最佳模型恢复权重和优化器状态（保持训练连续性）
-            model_candidate = PyTorchModel(board_size=board_size, action_size=action_size)
-            model_candidate.net.load_state_dict(model_best.net.state_dict())
-            model_candidate.optimizer.load_state_dict(model_best.optimizer.state_dict())
+            # 从最佳模型恢复权重（保持训练连续性）；优化器状态由 make_candidate 重建
+            model_candidate = make_candidate()
 
         # 定期保存模型快照
         if it % save_every == 0:
@@ -948,6 +966,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pretrained-model", default=None,
                    help="预训练模型路径（None/空串/none 表示从头训练）")
     p.add_argument("--resume-iteration", type=int, default=1, help="从第几次迭代继续（续训）")
+    p.add_argument("--lr", type=float, default=1e-3, help="学习率（微调强冠军建议 1e-4 ~ 3e-4）")
+    p.add_argument("--lr-decay", type=float, default=1.0, help="每迭代学习率乘子（如 0.95）")
+    p.add_argument("--train-value-only", action="store_true",
+                   help="只训价值头：冻结 trunk+策略（含 BN 统计量），用于已收敛模型的微调")
 
     # --- 多进程自对弈 ---
     p.add_argument("--selfplay-workers", type=int, default=0,
@@ -1010,6 +1032,9 @@ def main(argv=None) -> None:
         save_every=args.save_every,
         pretrained_model_path=pretrained,
         next_iteration_continuation=args.resume_iteration,
+        lr=args.lr,
+        lr_decay=args.lr_decay,
+        train_value_only=args.train_value_only,
 
         selfplay_num_workers=args.selfplay_workers,
         selfplay_device=args.selfplay_device,
